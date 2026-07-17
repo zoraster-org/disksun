@@ -1516,6 +1516,29 @@ impl eframe::App for App {
             .and_then(|h| self.wedges.get(h))
             .is_some_and(|w| w.lump && w.ring == 0);
 
+        // exactly one sidebar highlight at a time: a hovered wedge lights
+        // only its deepest matching row; the keyboard cursor shows only
+        // while nothing in the chart is hovered
+        let hover_row: Option<usize> = if hovered_lump {
+            side_rows
+                .iter()
+                .position(|r| matches!(&r.kind, SideKind::Toggle { key } if key.is_empty()))
+        } else {
+            hovered_path.as_ref().and_then(|hp| {
+                side_rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| match &r.kind {
+                        SideKind::Item { path, .. } if hp.starts_with(path) => {
+                            Some((i, path.len()))
+                        }
+                        _ => None,
+                    })
+                    .max_by_key(|&(_, len)| len)
+                    .map(|(i, _)| i)
+            })
+        };
+
         let mut side_clicked: Option<Vec<usize>> = None;
         let mut small_toggled: Option<Vec<usize>> = None;
 
@@ -1580,9 +1603,12 @@ impl eframe::App for App {
                 }
             }
         }
-        // rows change with every scan/navigation; never point past the end
-        if self.side_sel.is_some_and(|s| s >= side_rows.len()) {
-            self.side_sel = if side_rows.is_empty() { None } else { Some(side_rows.len() - 1) };
+        // rows change with every scan/navigation: keep the cursor in range,
+        // and park it on the first row of a fresh view so it's visible
+        // before any j/k is pressed
+        if self.side_sel.is_none() || self.side_sel.is_some_and(|s| s >= side_rows.len()) {
+            self.side_sel =
+                (0..side_rows.len()).find(|&i| !matches!(side_rows[i].kind, SideKind::Note));
         }
 
         egui::SidePanel::left("list").resizable(false).exact_width(320.0).show(ctx, |ui| {
@@ -1614,7 +1640,10 @@ impl eframe::App for App {
             let mut row_hover = None;
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (ri, row) in side_rows.iter().enumerate() {
-                    let cursor = self.side_sel == Some(ri); // vim keyboard cursor
+                    // one highlight only: hovered wedge's row, else the cursor
+                    let hl = hover_row == Some(ri)
+                        || (hover_row.is_none() && self.side_sel == Some(ri));
+                    let cursor = self.side_sel == Some(ri); // for scroll-into-view
                     ui.horizontal(|ui| {
                         // wrap long names within the fixed panel width
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
@@ -1622,10 +1651,7 @@ impl eframe::App for App {
                         ui.colored_label(row.color, if row.indent > 0 { "•" } else { "⏺" });
                         match &row.kind {
                             SideKind::Item { path, is_dir } => {
-                                let lit = hovered_path
-                                    .as_ref()
-                                    .is_some_and(|hp| hp.starts_with(path));
-                                let mut r = ui.selectable_label(lit || cursor, &row.label);
+                                let mut r = ui.selectable_label(hl, &row.label);
                                 if *is_dir {
                                     r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
                                 }
@@ -1640,10 +1666,9 @@ impl eframe::App for App {
                                 }
                             }
                             SideKind::Toggle { key } => {
-                                let lit = hovered_lump && key.is_empty();
                                 // '›' — egui's bundled fonts lack U+25B8 '▸'
                                 let r = ui
-                                    .selectable_label(lit || cursor, format!("› {}", row.label))
+                                    .selectable_label(hl, format!("› {}", row.label))
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                                 if r.hovered() && key.is_empty() {
                                     row_hover = Some(Vec::new()); // = the lump wedge
