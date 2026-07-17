@@ -414,6 +414,109 @@ fn trash_size_of(dirs: &[PathBuf]) -> u64 {
     dirs.iter().map(|d| dir_size(d)).sum()
 }
 
+/// One file/dir this session moved to the Trash — kept so Cancel (or
+/// quitting without emptying) can put it back where it came from.
+struct TrashedItem {
+    files_entry: PathBuf,
+    info_file: PathBuf,
+    original: PathBuf,
+}
+
+/// Percent-encode a path for a .trashinfo Path= line ('/' kept) so
+/// other trash tools can read it.
+fn encode_trash_path(p: &Path) -> String {
+    let mut out = String::new();
+    for &b in p.as_os_str().as_encoded_bytes() {
+        let c = b as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~') {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Move `path` into the given trash `files/` + `info/` pair (XDG spec:
+/// pick a free name in both, write the .trashinfo, then rename).
+fn trash_move_into(files: &Path, info: &Path, path: &Path) -> Result<TrashedItem, String> {
+    let base = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "item".into());
+    let mut name = base.clone();
+    let mut n = 1u32;
+    while files.join(&name).symlink_metadata().is_ok()
+        || info.join(format!("{name}.trashinfo")).symlink_metadata().is_ok()
+    {
+        n += 1;
+        name = format!("{base}.{n}");
+    }
+    let dest = files.join(&name);
+    let info_file = info.join(format!("{name}.trashinfo"));
+    // local time via `date` — not worth a chrono dependency
+    let date = std::process::Command::new("date")
+        .arg("+%Y-%m-%dT%H:%M:%S")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    std::fs::write(
+        &info_file,
+        format!("[Trash Info]\nPath={}\nDeletionDate={date}\n", encode_trash_path(path)),
+    )
+    .map_err(|e| e.to_string())?;
+    if let Err(e) = std::fs::rename(path, &dest) {
+        let _ = std::fs::remove_file(&info_file);
+        return Err(e.to_string());
+    }
+    Ok(TrashedItem { files_entry: dest, info_file, original: path.to_path_buf() })
+}
+
+/// Trash `path` per the XDG spec: the home trash when it shares the
+/// home filesystem, else `.Trash-$uid` at that volume's mount point
+/// (created on demand). Virtual/system mounts get no trash — the same
+/// refusal gio makes. Done natively: renames stay on one filesystem,
+/// so trashing is instant and exactly reversible.
+fn move_to_trash(path: &Path) -> Result<TrashedItem, String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("no $HOME")?;
+    let home_meta = std::fs::metadata(&home).map_err(|e| e.to_string())?;
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    let root = if meta.dev() == home_meta.dev() {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"))
+            .join("Trash")
+    } else {
+        read_mounts()
+            .into_iter()
+            .filter(|m| m.real && path.starts_with(&m.point))
+            .max_by_key(|m| m.point.components().count())
+            .map(|m| m.point.join(format!(".Trash-{}", home_meta.uid())))
+            .ok_or("this volume has no trash (virtual/system mount)")?
+    };
+    let files = root.join("files");
+    let info = root.join("info");
+    std::fs::create_dir_all(&files).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&info).map_err(|e| e.to_string())?;
+    trash_move_into(&files, &info, path)
+}
+
+/// Put a trashed item back where it came from (refuses to clobber a
+/// file that has reappeared at the original path).
+fn trash_restore(it: &TrashedItem) -> Result<(), String> {
+    if it.original.symlink_metadata().is_ok() {
+        return Err(format!("{} exists again", it.original.display()));
+    }
+    if let Some(parent) = it.original.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&it.files_entry, &it.original).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&it.info_file);
+    Ok(())
+}
+
 /// Empty the given trash roots per the XDG trash spec: everything under
 /// `files/`, the matching `info/*.trashinfo`, and the `directorysizes`
 /// cache. Done directly rather than via `gio trash --empty`, which needs
@@ -525,6 +628,7 @@ struct App {
     dragging: Option<usize>,          // index into wedges
     pending_trash: Option<(PathBuf, String)>,
     pending_empty: bool,              // "Empty Trash?" confirm modal is up
+    session_trash: Vec<TrashedItem>,  // trashed this session; Cancel/quit restores
     side_sel: Option<usize>,          // keyboard cursor: index into the sidebar rows
     pending_g: bool,                  // first g of a gg chord was pressed
     trash_size: Option<u64>,          // None until the first background measure lands
@@ -555,6 +659,7 @@ impl App {
             dragging: None,
             pending_trash: None,
             pending_empty: false,
+            session_trash: Vec::new(),
             side_sel: None,
             pending_g: false,
             trash_size: None,
@@ -807,11 +912,12 @@ impl App {
     }
 
     fn do_trash(&mut self, path: &Path, ctx: &egui::Context) {
-        let res = std::process::Command::new("gio").arg("trash").arg("--").arg(path).output();
-        let msg = match res {
-            Ok(o) if o.status.success() => format!("Moved to Trash: {}", path.display()),
-            Ok(o) => format!("Trash failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
-            Err(e) => format!("Trash failed (need `gio`): {e}"),
+        let msg = match move_to_trash(path) {
+            Ok(item) => {
+                self.session_trash.push(item);
+                format!("Moved to Trash: {}", path.display())
+            }
+            Err(e) => format!("Trash failed: {e}"),
         };
         self.toast = Some((msg, ctx.input(|i| i.time) + 5.0));
         // rescan current volume to reflect the deletion
@@ -819,6 +925,20 @@ impl App {
         let admin = matches!(self.state, State::Scanning { admin: true, .. });
         self.begin_scan(root, admin, false);
         self.refresh_trash(false); // the bin just gained content
+    }
+
+    /// Cancel: move everything this session trashed back where it came
+    /// from. Returns (restored, failed).
+    fn restore_session_trash(&mut self) -> (usize, usize) {
+        let items = std::mem::take(&mut self.session_trash);
+        let (mut ok, mut fail) = (0, 0);
+        for it in &items {
+            match trash_restore(it) {
+                Ok(()) => ok += 1,
+                Err(_) => fail += 1,
+            }
+        }
+        (ok, fail)
     }
 
     fn draw_trash_can(painter: &egui::Painter, rect: Rect, hot: bool) {
@@ -922,24 +1042,27 @@ impl App {
 
         // hover / drag hit-test in polar coordinates (idle only)
         let ptr = resp.hover_pos().or_else(|| ui.ctx().pointer_latest_pos());
-        self.hovered = None;
-        let mut hover_hub = false;
-        if let Some(mp) = resp.hover_pos().filter(|_| !animating) {
+        let wedges_ref = &self.wedges;
+        let wedge_at = |mp: egui::Pos2| -> Option<usize> {
             let d = mp - center;
             let r = d.length();
             if r < hub_r {
+                return None;
+            }
+            let mut ang = d.y.atan2(d.x);
+            if ang < 0.0 {
+                ang += TAU;
+            }
+            let ring = rings.iter().position(|&(r0, r1)| r >= r0 && r <= r1)?;
+            wedges_ref.iter().position(|w| w.ring == ring && ang >= w.a0 && ang < w.a1)
+        };
+        self.hovered = None;
+        let mut hover_hub = false;
+        if let Some(mp) = resp.hover_pos().filter(|_| !animating) {
+            if (mp - center).length() < hub_r {
                 hover_hub = !self.nav.is_empty();
             } else {
-                let mut ang = d.y.atan2(d.x);
-                if ang < 0.0 {
-                    ang += TAU;
-                }
-                if let Some(ring) = rings.iter().position(|&(r0, r1)| r >= r0 && r <= r1) {
-                    self.hovered = self
-                        .wedges
-                        .iter()
-                        .position(|w| w.ring == ring && ang >= w.a0 && ang < w.a1);
-                }
+                self.hovered = wedge_at(mp);
             }
         }
         // sidebar hover lights the matching slice exactly like chart hover
@@ -954,8 +1077,13 @@ impl App {
             }
         }
 
-        if resp.drag_started() {
-            self.dragging = self.hovered;
+        if resp.drag_started() && !animating {
+            // hit-test the PRESS position: with click_and_drag egui waits
+            // ~6px of travel before the drag starts, and outer rings are
+            // thinner than that — hit-testing the by-then-moved pointer
+            // grabbed (and trashed) an inner ring's wedge instead
+            let origin = ui.ctx().input(|i| i.pointer.press_origin());
+            self.dragging = origin.and_then(|p| wedge_at(p));
         }
         let over_trash = ptr.map(|p| trash.contains(p)).unwrap_or(false);
 
@@ -1113,6 +1241,37 @@ impl App {
 
         Self::draw_trash_can(&painter, trash, over_trash && self.dragging.is_some());
 
+        // Cancel: un-trash everything this session moved to the bin
+        if !self.session_trash.is_empty() {
+            let cancel_rect = Rect::from_min_max(
+                egui::pos2(rect.right() - 296.0, trash.top() - 36.0),
+                egui::pos2(rect.right() - 180.0, trash.top() - 12.0),
+            );
+            let n = self.session_trash.len();
+            let r = ui
+                .put(
+                    cancel_rect,
+                    egui::Button::new(
+                        egui::RichText::new(format!("Cancel ({n})")).size(11.0),
+                    ),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Move everything trashed this session back where it came from");
+            if r.clicked() {
+                let (ok, fail) = self.restore_session_trash();
+                let msg = if fail == 0 {
+                    format!("Restored {ok} item(s) from Trash")
+                } else {
+                    format!("Restored {ok} item(s), {fail} failed")
+                };
+                self.toast = Some((msg, ui.ctx().input(|i| i.time) + 5.0));
+                let root = self.scan_root.clone();
+                let admin = matches!(self.state, State::Scanning { admin: true, .. });
+                self.begin_scan(root, admin, false);
+                self.refresh_trash(false);
+            }
+        }
+
         // Empty Trash: size readout + button above the bin. human() picks
         // the unit (B / KiB / MiB / GiB / TiB) to match the size.
         if let Some(sz) = self.trash_size {
@@ -1215,6 +1374,13 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // the Trash is a staging area: anything trashed this session and
+        // never emptied goes back where it came from when the app quits —
+        // only an explicit Empty Trash is final
+        let _ = self.restore_session_trash();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // keys are app-wide shortcuts only while no text field has focus
         let typing = ctx.wants_keyboard_input();
@@ -1732,7 +1898,11 @@ impl eframe::App for App {
                     self.trash_size = Some(sz);
                     self.trash_rx = None;
                     let msg = match emptied {
-                        Some(true) => Some("Trash emptied"),
+                        Some(true) => {
+                            // emptied = final: nothing left to restore
+                            self.session_trash.clear();
+                            Some("Trash emptied")
+                        }
                         Some(false) => Some("Couldn't empty some Trash items"),
                         None => None,
                     };
@@ -1868,6 +2038,37 @@ mod tests {
         assert!(std::fs::read_dir(&files).unwrap().next().is_none());
         assert!(std::fs::read_dir(&info).unwrap().next().is_none());
         assert!(!root.join("Trash/directorysizes").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn trash_move_and_restore_round_trip() {
+        let root = std::env::temp_dir().join(format!("disksun-rt-{}", std::process::id()));
+        let files = root.join("Trash/files");
+        let info = root.join("Trash/info");
+        let src = root.join("data/sub");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        let victim = src.join("victim.txt");
+        std::fs::write(&victim, b"first").unwrap();
+
+        let item = trash_move_into(&files, &info, &victim).unwrap();
+        assert!(!victim.exists());
+        assert!(item.files_entry.exists());
+        assert!(item.info_file.exists());
+
+        // same name trashed again gets a fresh slot, no clobber
+        std::fs::write(&victim, b"second").unwrap();
+        let item2 = trash_move_into(&files, &info, &victim).unwrap();
+        assert_ne!(item.files_entry, item2.files_entry);
+
+        // restore puts it back; restoring over an existing file refuses
+        trash_restore(&item2).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"second");
+        assert!(trash_restore(&item).is_err());
+        assert!(item.files_entry.exists()); // refused restore left it in trash
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
