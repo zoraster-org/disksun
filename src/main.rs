@@ -1053,17 +1053,19 @@ impl App {
                 ci.gamma_multiply(alpha), co.gamma_multiply(alpha),
             );
 
-            // label the first three rings wherever the segment has room:
-            // the arc must be long enough and the ring thick enough. Font
-            // scales down with the chart (small windows), and the room
-            // checks scale with the font — fixed pixel thresholds made
-            // most labels vanish as soon as the window shrank.
-            if !animating && w.ring <= 2 {
+            // label any ring where the segment has room: the arc must be
+            // long enough and the ring thick enough. Font scales down with
+            // the chart (small windows), the room checks scale with the
+            // font, the name truncates to the arc that's actually there,
+            // and rings too thin for two text lines get a name-only label.
+            if !animating {
                 let mid_r = (r0 + r1) * 0.5;
                 let arc_len = (w.a1 - w.a0) * mid_r;
                 let scale = (max_r / 320.0).clamp(0.65, 1.0);
                 let font = ((if w.ring == 0 { 12.5 } else { 11.0 }) * scale).max(8.0);
-                if arc_len > font * 6.0 && r1 - r0 > font * 1.9 {
+                let max_chars = (arc_len / (font * 0.62)) as usize;
+                let thick = r1 - r0;
+                if max_chars >= 6 && thick > font * 1.1 {
                     let mid = (w.a0 + w.a1) * 0.5;
                     let lp = center + vec2(mid.cos(), mid.sin()) * mid_r;
                     // black on light fills, white on dark ones (grey lumps)
@@ -1075,13 +1077,12 @@ impl App {
                     } else {
                         Color32::from_gray(235)
                     };
-                    painter.text(
-                        lp,
-                        Align2::CENTER_CENTER,
-                        format!("{}\n{}", truncate(&w.name, 14), human(w.size)),
-                        FontId::proportional(font),
-                        text_col,
-                    );
+                    let txt = if thick > font * 2.1 {
+                        format!("{}\n{}", truncate(&w.name, max_chars.min(18)), human(w.size))
+                    } else {
+                        truncate(&w.name, max_chars.min(18))
+                    };
+                    painter.text(lp, Align2::CENTER_CENTER, txt, FontId::proportional(font), text_col);
                 }
             }
         }
@@ -1691,7 +1692,15 @@ impl eframe::App for App {
                     });
                 }
             });
-            self.side_hover = row_hover;
+            // no row under the mouse: the vim cursor lights its wedge just
+            // like a hover would (chart-side mouse hover still wins there)
+            self.side_hover = row_hover.or_else(|| {
+                self.side_sel.and_then(|s| match &side_rows.get(s)?.kind {
+                    SideKind::Item { path, .. } => Some(path.clone()),
+                    SideKind::Toggle { key } if key.is_empty() => Some(Vec::new()),
+                    _ => None,
+                })
+            });
         });
         if let Some(key) = small_toggled {
             // enter the smaller-items view (of the shown dir, or of a child)
