@@ -1054,14 +1054,18 @@ impl App {
             );
 
             // label the first three rings wherever the segment has room:
-            // the arc must be long enough and the ring thick enough
+            // the arc must be long enough and the ring thick enough. Font
+            // scales down with the chart (small windows), and the room
+            // checks scale with the font — fixed pixel thresholds made
+            // most labels vanish as soon as the window shrank.
             if !animating && w.ring <= 2 {
                 let mid_r = (r0 + r1) * 0.5;
                 let arc_len = (w.a1 - w.a0) * mid_r;
-                if arc_len > 76.0 && r1 - r0 > 24.0 {
+                let scale = (max_r / 320.0).clamp(0.65, 1.0);
+                let font = ((if w.ring == 0 { 12.5 } else { 11.0 }) * scale).max(8.0);
+                if arc_len > font * 6.0 && r1 - r0 > font * 1.9 {
                     let mid = (w.a0 + w.a1) * 0.5;
                     let lp = center + vec2(mid.cos(), mid.sin()) * mid_r;
-                    let font = if w.ring == 0 { 12.5 } else { 11.0 };
                     // black on light fills, white on dark ones (grey lumps)
                     let lum = 0.299 * (ci.r() as f32 + co.r() as f32) * 0.5
                         + 0.587 * (ci.g() as f32 + co.g() as f32) * 0.5
