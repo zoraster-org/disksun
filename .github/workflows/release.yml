@@ -48,25 +48,48 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Strip binary
         run: strip "target/${{ matrix.target }}/release/disksun"
 
-      - name: Package
+      - name: Build .deb
+        run: cargo deb --target ${{ matrix.target }} --no-build --no-strip
+
+      - name: Build .rpm
+        run: cargo generate-rpm --target ${{ matrix.target }}
+
+      - name: Package tarball
         run: |
           set -eu
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           stem="disksun-${tag}-${{ matrix.target }}"
           mkdir -p "dist/$stem/contrib"
           cp "target/${{ matrix.target }}/release/disksun" "dist/$stem/"
-          cp LICENSE README.md "dist/$stem/"
-          cp contrib/disksun-launch.sh contrib/disksun.desktop \
-             contrib/disksun.svg contrib/install-desktop.sh \
+          cp LICENSE README.md                              "dist/$stem/"
+          cp packaging/install.sh                           "dist/$stem/"
+          chmod +x "dist/$stem/install.sh"
+          cp contrib/disksun-launch.sh \
+             contrib/disksun.desktop \
+             contrib/disksun.svg \
+             contrib/install-desktop.sh \
              "dist/$stem/contrib/"
           tar -C dist -czf "$stem.tar.gz" "$stem"
-          sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256"
+
+      - name: Collect + checksum artifacts
+        run: |
+          set -eu
+          mv target/${{ matrix.target }}/debian/*.deb        .
+          mv target/${{ matrix.target }}/generate-rpm/*.rpm  .
+          for f in *.tar.gz *.deb *.rpm; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -la *.tar.gz *.deb *.rpm *.sha256
 
       - uses: actions/upload-artifact@v4
         with:
@@ -74,6 +97,10 @@ jobs:
           path: |
             disksun-*.tar.gz
             disksun-*.tar.gz.sha256
+            *.deb
+            *.deb.sha256
+            *.rpm
+            *.rpm.sha256
           if-no-files-found: error
 
   release:

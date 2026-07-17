@@ -17,22 +17,68 @@ runs on both Wayland and X11.
 
 ## Install
 
+### One-liner (recommended)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zoraster-org/disksun/main/packaging/get-disksun.sh | sh
+```
+
+Detects your CPU (x86_64 / aarch64), downloads the latest release
+tarball, installs the binary to `~/.local/bin/disksun`, and wires up the
+GUI menu entry. No Rust toolchain required.
+
+### Debian / Ubuntu (.deb)
+
+Grab the `.deb` for your architecture from the
+[latest release](https://github.com/zoraster-org/disksun/releases/latest):
+
+```sh
+sudo apt install ./disksun_*_amd64.deb    # or ..._arm64.deb
+```
+
+Installs binary, `.desktop`, and icon system-wide. Uninstall with
+`sudo apt remove disksun`.
+
+### Fedora / RHEL (.rpm)
+
+Grab the `.rpm` for your architecture from the
+[latest release](https://github.com/zoraster-org/disksun/releases/latest):
+
+```sh
+sudo dnf install ./disksun-*.x86_64.rpm    # or ...aarch64.rpm
+```
+
+Uninstall with `sudo dnf remove disksun`.
+
+### Prebuilt tarball (manual)
+
+Download `disksun-<tag>-<target>.tar.gz` from the
+[releases page](https://github.com/zoraster-org/disksun/releases), extract
+it, then run the bundled installer:
+
+```sh
+tar xzf disksun-*.tar.gz
+cd disksun-*/
+./install.sh
+```
+
+Installs to `~/.local/bin/` and the XDG data dirs — no root.
+
 ### From source with cargo
 
 ```sh
 cargo install --git https://github.com/zoraster-org/disksun
 ```
 
-This drops `disksun` into `~/.cargo/bin`. Add that to your `PATH` if it
-isn't already.
-
-You'll need the Rust toolchain (`rustup` or your distro's `rust` +
-`cargo`) and the runtime libraries listed below.
+Drops `disksun` into `~/.cargo/bin`. Needs the Rust toolchain plus the
+runtime libraries listed below. If you want a menu entry, follow
+[GUI menu entry](#gui-menu-entry) below.
 
 ### Runtime dependencies
 
-`eframe` dlopens the display-server and GL libraries at runtime. Install
-whichever your system provides:
+`eframe` dlopens the display-server and GL libraries at runtime. The
+`.deb` / `.rpm` packages already pull these in — this table is only for
+`cargo install`, the tarball, or building from source:
 
 | Distro           | Package(s)                                                   |
 | ---------------- | ------------------------------------------------------------ |
