@@ -2,6 +2,8 @@
 
 interactive pie/sunburst disk-usage viewer for Linux.
 
+![Screenshot of disksun scanning /](docs/screenshot.png)
+
 A directory is drawn as a pie: every child is a wedge whose angle is
 proportional to its share of the parent. Click a directory wedge to descend,
 `h` / `Backspace` / the "Up" button to go back. Drag a wedge onto the trash
@@ -86,6 +88,34 @@ under `sudo` in a terminal so it can read paths your user can't.
 from its parent (useful when binding it to a waybar/i3blocks/eww button so
 a bar reload doesn't kill the GUI). Copy it into your `$PATH` or crib the
 one line.
+
+## GUI menu entry
+
+If you use a desktop that shows a graphical app menu (GNOME, KDE, XFCE,
+Cinnamon, wofi, rofi, `bemenu -x run` etc.), install the `.desktop` file
+and icon so Disksun shows up alongside your other apps:
+
+```sh
+# From a git checkout or an extracted release tarball:
+./contrib/install-desktop.sh
+```
+
+The script copies `contrib/disksun.desktop` to
+`$XDG_DATA_HOME/applications/` and `contrib/disksun.svg` to
+`$XDG_DATA_HOME/icons/hicolor/scalable/apps/` (both default to `~/.local/share/…`)
+and refreshes the desktop/icon caches if the helpers are installed. Log
+out and back in if the entry doesn't appear immediately.
+
+If you installed via `cargo install --git …` and don't have the repo
+locally, grab the three files first:
+
+```sh
+mkdir -p /tmp/disksun-contrib && cd /tmp/disksun-contrib
+for f in disksun.desktop disksun.svg install-desktop.sh; do
+  curl -fsSLO "https://raw.githubusercontent.com/zoraster-org/disksun/main/contrib/$f"
+done
+chmod +x install-desktop.sh && ./install-desktop.sh
+```
 
 ## License
 

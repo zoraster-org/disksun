@@ -59,10 +59,12 @@ jobs:
           set -eu
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           stem="disksun-${tag}-${{ matrix.target }}"
-          mkdir -p "dist/$stem"
+          mkdir -p "dist/$stem/contrib"
           cp "target/${{ matrix.target }}/release/disksun" "dist/$stem/"
           cp LICENSE README.md "dist/$stem/"
-          cp contrib/disksun-launch.sh "dist/$stem/"
+          cp contrib/disksun-launch.sh contrib/disksun.desktop \
+             contrib/disksun.svg contrib/install-desktop.sh \
+             "dist/$stem/contrib/"
           tar -C dist -czf "$stem.tar.gz" "$stem"
           sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256"
 

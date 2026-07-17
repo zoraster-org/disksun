@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Disksun
+GenericName=Disk Usage Viewer
+Comment=interactive pie disk-usage viewer
+Exec=disksun
+Icon=disksun
+Terminal=false
+Categories=System;FileTools;Utility;
+Keywords=disk;usage;storage;filesystem;sunburst;
+StartupWMClass=disksun
