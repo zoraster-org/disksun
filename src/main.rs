@@ -3,9 +3,8 @@
 // A directory is drawn as a PIE: every child is a wedge radiating from the
 // centre, its angle proportional to its share of the directory. Click a
 // directory wedge to descend; "Up" / h / Backspace to go back. Drag any
-// wedge onto the bin (bottom-right) to permanently delete that file/folder
-// via `rm -rf` semantics (a confirm dialog fires first — this cannot be
-// undone). The sidebar lists the largest children; the top bar lets you
+// wedge onto the trash can (bottom-right) to move that file/folder to the
+// Trash. The sidebar lists the largest children; the top bar lets you
 // rescan an arbitrary path, jump to any mounted partition, or scan the
 // whole disk as admin (root, via sudo in a terminal).
 //
@@ -450,7 +449,7 @@ struct App {
     wedges: Vec<Wedge>,
     hovered: Option<usize>,
     dragging: Option<usize>,          // index into wedges
-    pending_delete: Option<(PathBuf, String)>,
+    pending_trash: Option<(PathBuf, String)>,
     toast: Option<(String, f64)>,     // (message, expiry time)
     anim: Option<Anim>,
     pending_up: Option<usize>,  // child index we just came up out of
@@ -474,7 +473,7 @@ impl App {
             wedges: Vec::new(),
             hovered: None,
             dragging: None,
-            pending_delete: None,
+            pending_trash: None,
             toast: None,
             anim: None,
             pending_up: None,
@@ -707,22 +706,15 @@ impl App {
         (inner, outer)
     }
 
-    fn do_delete(&mut self, path: &Path, ctx: &egui::Context) {
-        // `symlink_metadata` so a symlink to a directory is removed as a
-        // symlink (not recursively followed).
-        let is_dir = std::fs::symlink_metadata(path)
-            .map(|m| m.file_type().is_dir())
-            .unwrap_or(false);
-        let res = if is_dir {
-            std::fs::remove_dir_all(path)
-        } else {
-            std::fs::remove_file(path)
-        };
+    fn do_trash(&mut self, path: &Path, ctx: &egui::Context) {
+        let res = std::process::Command::new("gio").arg("trash").arg("--").arg(path).output();
         let msg = match res {
-            Ok(()) => format!("Deleted: {}", path.display()),
-            Err(e) => format!("Delete failed: {e}"),
+            Ok(o) if o.status.success() => format!("Moved to Trash: {}", path.display()),
+            Ok(o) => format!("Trash failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
+            Err(e) => format!("Trash failed (need `gio`): {e}"),
         };
         self.toast = Some((msg, ctx.input(|i| i.time) + 5.0));
+        // rescan current volume to reflect the deletion
         let root = self.scan_root.clone();
         let admin = matches!(self.state, State::Scanning { admin: true, .. });
         self.begin_scan(root, admin, false);
@@ -750,7 +742,7 @@ impl App {
         painter.text(
             rect.center_bottom() + vec2(0.0, rect.height() * 0.27),
             Align2::CENTER_TOP,
-            "drop to delete",
+            "drop to Trash",
             FontId::proportional((rect.height() * 0.23).clamp(8.0, 12.0)),
             col,
         );
@@ -1042,8 +1034,8 @@ impl App {
                     w.name,
                     human(w.size),
                     w.frac * 100.0,
-                    if w.is_dir { "\nclick to open · drag to delete" }
-                    else if w.abs.is_some() { "\ndrag to delete" }
+                    if w.is_dir { "\nclick to open · drag to Trash" }
+                    else if w.abs.is_some() { "\ndrag to Trash" }
                     else { "" },
                 );
                 egui::show_tooltip_at_pointer(
@@ -1064,7 +1056,7 @@ impl App {
                 if let Some(di) = self.dragging {
                     if let Some(abs) = self.wedges.get(di).and_then(|w| w.abs.clone()) {
                         let name = self.wedges[di].name.clone();
-                        self.pending_delete = Some((abs, name));
+                        self.pending_trash = Some((abs, name));
                     }
                 }
             }
@@ -1488,30 +1480,20 @@ impl eframe::App for App {
             self.draw_daisy(ui, shown_size, &shown_name);
         });
 
-        // ---- delete confirm modal ----
-        if let Some((path, name)) = self.pending_delete.clone() {
+        // ---- trash confirm modal ----
+        if let Some((path, name)) = self.pending_trash.clone() {
             let mut close = false;
-            egui::Window::new("Delete permanently?")
+            egui::Window::new("Move to Trash?")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label(format!("Permanently delete “{name}”?"));
+                    ui.label(format!("Move “{name}” to the Trash?"));
                     ui.label(egui::RichText::new(path.to_string_lossy()).weak());
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new("This cannot be undone.")
-                            .color(Color32::from_rgb(240, 90, 90))
-                            .strong(),
-                    );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        let delete_btn = ui.button(
-                            egui::RichText::new("Delete")
-                                .color(Color32::from_rgb(240, 90, 90)),
-                        );
-                        if delete_btn.clicked() {
-                            self.do_delete(&path, ctx);
+                        if ui.button("Move to Trash").clicked() {
+                            self.do_trash(&path, ctx);
                             close = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -1520,7 +1502,7 @@ impl eframe::App for App {
                     });
                 });
             if close {
-                self.pending_delete = None;
+                self.pending_trash = None;
             }
         }
     }
