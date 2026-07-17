@@ -368,6 +368,84 @@ fn human(bytes: u64) -> String {
     if u == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[u]) }
 }
 
+/// XDG trash content dirs that exist: the home trash plus per-volume
+/// trashes ($topdir/.Trash/$uid and $topdir/.Trash-$uid) on real mounts —
+/// the same set `gio trash --empty` empties.
+fn trash_files_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(data) = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".local/share")))
+    {
+        out.push(data.join("Trash/files"));
+    }
+    let uid = home.as_ref().and_then(|h| std::fs::metadata(h).ok()).map(|m| m.uid());
+    if let Some(uid) = uid {
+        for m in read_mounts() {
+            if m.real {
+                out.push(m.point.join(format!(".Trash/{uid}/files")));
+                out.push(m.point.join(format!(".Trash-{uid}/files")));
+            }
+        }
+    }
+    out.retain(|p| p.is_dir());
+    out
+}
+
+/// Total disk usage of everything in the given trash `files/` dirs.
+fn trash_size_of(dirs: &[PathBuf]) -> u64 {
+    fn dir_size(p: &Path) -> u64 {
+        let mut sum = 0;
+        if let Ok(entries) = std::fs::read_dir(p) {
+            for e in entries.flatten() {
+                let Ok(meta) = e.metadata() else { continue };
+                if meta.file_type().is_symlink() {
+                    continue;
+                } else if meta.is_dir() {
+                    sum += dir_size(&e.path());
+                } else {
+                    sum += meta.blocks() * 512; // real usage, like the scanner
+                }
+            }
+        }
+        sum
+    }
+    dirs.iter().map(|d| dir_size(d)).sum()
+}
+
+fn trash_total_size() -> u64 {
+    trash_size_of(&trash_files_dirs())
+}
+
+/// Empty the given trash roots per the XDG trash spec: everything under
+/// `files/`, the matching `info/*.trashinfo`, and the `directorysizes`
+/// cache. Done directly rather than via `gio trash --empty`, which needs
+/// the gvfs daemons that minimal (wlroots) sessions don't run.
+fn empty_trash_of(dirs: &[PathBuf]) -> bool {
+    let mut ok = true;
+    for files in dirs {
+        if let Ok(entries) = std::fs::read_dir(files) {
+            for e in entries.flatten() {
+                let is_dir = e.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink());
+                ok &= if is_dir {
+                    std::fs::remove_dir_all(e.path()).is_ok()
+                } else {
+                    std::fs::remove_file(e.path()).is_ok()
+                };
+            }
+        }
+        let Some(root) = files.parent() else { continue };
+        if let Ok(entries) = std::fs::read_dir(root.join("info")) {
+            for e in entries.flatten() {
+                ok &= std::fs::remove_file(e.path()).is_ok();
+            }
+        }
+        let _ = std::fs::remove_file(root.join("directorysizes"));
+    }
+    ok
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -450,6 +528,10 @@ struct App {
     hovered: Option<usize>,
     dragging: Option<usize>,          // index into wedges
     pending_trash: Option<(PathBuf, String)>,
+    pending_empty: bool,              // "Empty Trash?" confirm modal is up
+    trash_size: Option<u64>,          // None until the first background measure lands
+    // (new size, Some(ok) if this refresh also emptied the trash)
+    trash_rx: Option<mpsc::Receiver<(u64, Option<bool>)>>,
     toast: Option<(String, f64)>,     // (message, expiry time)
     anim: Option<Anim>,
     pending_up: Option<usize>,  // child index we just came up out of
@@ -463,7 +545,7 @@ impl App {
     fn new(path: PathBuf, cross_real: bool) -> Self {
         let prog = Arc::new(Progress::default());
         let rx = start_scan(path.clone(), cross_real, prog.clone());
-        Self {
+        let mut app = Self {
             path_input: path.to_string_lossy().into_owned(),
             scan_root: path,
             state: State::Scanning { rx, admin: false },
@@ -474,12 +556,29 @@ impl App {
             hovered: None,
             dragging: None,
             pending_trash: None,
+            pending_empty: false,
+            trash_size: None,
+            trash_rx: None,
             toast: None,
             anim: None,
             pending_up: None,
             side_hover: None,
             small_focus: false,
-        }
+        };
+        app.refresh_trash(false);
+        app
+    }
+
+    /// Re-measure the trash on a worker thread; `empty_first` empties it
+    /// before measuring.
+    fn refresh_trash(&mut self, empty_first: bool) {
+        let (tx, rx) = mpsc::channel();
+        self.trash_rx = Some(rx);
+        std::thread::spawn(move || {
+            let dirs = trash_files_dirs();
+            let emptied = empty_first.then(|| empty_trash_of(&dirs));
+            let _ = tx.send((trash_size_of(&dirs), emptied));
+        });
     }
 
     /// Descend into the directory behind wedge `wi`, zoom-animated.
@@ -718,6 +817,7 @@ impl App {
         let root = self.scan_root.clone();
         let admin = matches!(self.state, State::Scanning { admin: true, .. });
         self.begin_scan(root, admin, false);
+        self.refresh_trash(false); // the bin just gained content
     }
 
     fn draw_trash_can(painter: &egui::Painter, rect: Rect, hot: bool) {
@@ -1006,6 +1106,38 @@ impl App {
         );
 
         Self::draw_trash_can(&painter, trash, over_trash && self.dragging.is_some());
+
+        // Empty Trash: size readout + button above the bin. human() picks
+        // the unit (B / KiB / MiB / GiB / TiB) to match the size.
+        if let Some(sz) = self.trash_size {
+            let btn_rect = Rect::from_min_max(
+                egui::pos2(rect.right() - 170.0, trash.top() - 36.0),
+                egui::pos2(rect.right() - 10.0, trash.top() - 12.0),
+            );
+            if sz == 0 {
+                painter.text(
+                    btn_rect.right_center(),
+                    Align2::RIGHT_CENTER,
+                    "Trash is empty",
+                    FontId::proportional(11.0),
+                    Color32::from_gray(120),
+                );
+            } else {
+                let r = ui
+                    .put(
+                        btn_rect,
+                        egui::Button::new(
+                            egui::RichText::new(format!("Empty Trash · {}", human(sz)))
+                                .size(11.0),
+                        ),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Permanently delete everything in the Trash");
+                if r.clicked() {
+                    self.pending_empty = true;
+                }
+            }
+        }
 
 
         // dragging chip
@@ -1476,6 +1608,28 @@ impl eframe::App for App {
             }
         }
 
+        // background trash-measure result (and possible empty outcome)
+        if let Some(rx) = &self.trash_rx {
+            match rx.try_recv() {
+                Ok((sz, emptied)) => {
+                    self.trash_size = Some(sz);
+                    self.trash_rx = None;
+                    let msg = match emptied {
+                        Some(true) => Some("Trash emptied"),
+                        Some(false) => Some("Couldn't empty some Trash items"),
+                        None => None,
+                    };
+                    if let Some(m) = msg {
+                        self.toast = Some((m.into(), ctx.input(|i| i.time) + 5.0));
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.trash_rx = None,
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             self.draw_daisy(ui, shown_size, &shown_name);
         });
@@ -1503,6 +1657,45 @@ impl eframe::App for App {
                 });
             if close {
                 self.pending_trash = None;
+            }
+        }
+
+        // ---- empty-trash confirm modal ----
+        if self.pending_empty {
+            let mut close = false;
+            let sz = self.trash_size.unwrap_or(0);
+            egui::Window::new("Empty Trash?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Permanently delete everything in the Trash ({})?",
+                        human(sz)
+                    ));
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("This cannot be undone.")
+                            .color(Color32::from_rgb(240, 90, 90))
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let empty_btn = ui.button(
+                            egui::RichText::new("Empty Trash")
+                                .color(Color32::from_rgb(240, 90, 90)),
+                        );
+                        if empty_btn.clicked() {
+                            self.refresh_trash(true);
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if close {
+                self.pending_empty = false;
             }
         }
     }
@@ -1533,4 +1726,31 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |_cc| Ok(Box::new(App::new(path, cross)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_trash_clears_measured_dirs() {
+        let root = std::env::temp_dir().join(format!("disksun-test-{}", std::process::id()));
+        let files = root.join("Trash/files");
+        let info = root.join("Trash/info");
+        std::fs::create_dir_all(files.join("adir")).unwrap();
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(files.join("a.dat"), vec![0u8; 8192]).unwrap();
+        std::fs::write(files.join("adir/b.dat"), vec![0u8; 8192]).unwrap();
+        std::fs::write(info.join("a.dat.trashinfo"), "x").unwrap();
+        std::fs::write(root.join("Trash/directorysizes"), "x").unwrap();
+
+        let dirs = vec![files.clone()];
+        assert!(trash_size_of(&dirs) >= 16384);
+        assert!(empty_trash_of(&dirs));
+        assert_eq!(trash_size_of(&dirs), 0);
+        assert!(std::fs::read_dir(&files).unwrap().next().is_none());
+        assert!(std::fs::read_dir(&info).unwrap().next().is_none());
+        assert!(!root.join("Trash/directorysizes").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
