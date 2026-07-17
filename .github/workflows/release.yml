@@ -81,26 +81,20 @@ jobs:
              "dist/$stem/contrib/"
           tar -C dist -czf "$stem.tar.gz" "$stem"
 
-      - name: Collect + checksum artifacts
+      - name: Collect artifacts
         run: |
           set -eu
           mv target/${{ matrix.target }}/debian/*.deb        .
           mv target/${{ matrix.target }}/generate-rpm/*.rpm  .
-          for f in *.tar.gz *.deb *.rpm; do
-            sha256sum "$f" > "$f.sha256"
-          done
-          ls -la *.tar.gz *.deb *.rpm *.sha256
+          ls -la *.tar.gz *.deb *.rpm
 
       - uses: actions/upload-artifact@v4
         with:
           name: disksun-${{ matrix.target }}
           path: |
             disksun-*.tar.gz
-            disksun-*.tar.gz.sha256
             *.deb
-            *.deb.sha256
             *.rpm
-            *.rpm.sha256
           if-no-files-found: error
 
   release:
@@ -113,6 +107,14 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # one manifest covering every artifact (verify: sha256sum -c SHA256SUMS)
+      - name: Checksum manifest
+        run: |
+          set -eu
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
@@ -120,3 +122,17 @@ jobs:
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+      # re-published releases only replace same-named assets; drop the
+      # per-file .sha256 sidecars that predate the SHA256SUMS manifest
+      - name: Remove obsolete per-file .sha256 assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[].name' \
+            | grep '\.sha256$' | while read -r a; do
+              gh release delete-asset "$tag" "$a" --repo "$GITHUB_REPOSITORY" --yes
+            done || true
