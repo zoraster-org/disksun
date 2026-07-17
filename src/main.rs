@@ -414,10 +414,6 @@ fn trash_size_of(dirs: &[PathBuf]) -> u64 {
     dirs.iter().map(|d| dir_size(d)).sum()
 }
 
-fn trash_total_size() -> u64 {
-    trash_size_of(&trash_files_dirs())
-}
-
 /// Empty the given trash roots per the XDG trash spec: everything under
 /// `files/`, the matching `info/*.trashinfo`, and the `directorysizes`
 /// cache. Done directly rather than via `gio trash --empty`, which needs
@@ -529,6 +525,8 @@ struct App {
     dragging: Option<usize>,          // index into wedges
     pending_trash: Option<(PathBuf, String)>,
     pending_empty: bool,              // "Empty Trash?" confirm modal is up
+    side_sel: Option<usize>,          // keyboard cursor: index into the sidebar rows
+    pending_g: bool,                  // first g of a gg chord was pressed
     trash_size: Option<u64>,          // None until the first background measure lands
     // (new size, Some(ok) if this refresh also emptied the trash)
     trash_rx: Option<mpsc::Receiver<(u64, Option<bool>)>>,
@@ -557,6 +555,8 @@ impl App {
             dragging: None,
             pending_trash: None,
             pending_empty: false,
+            side_sel: None,
+            pending_g: false,
             trash_size: None,
             trash_rx: None,
             toast: None,
@@ -608,6 +608,7 @@ impl App {
         } else if let Some(pi) = self.nav.pop() {
             self.pending_up = Some(pi);
         }
+        self.side_sel = None; // new view, new keyboard cursor
     }
 
     fn begin_scan(&mut self, path: PathBuf, admin: bool, cross_real: bool) {
@@ -1210,10 +1211,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.key_pressed(egui::Key::H) || i.key_pressed(egui::Key::Backspace)) {
+        // keys are app-wide shortcuts only while no text field has focus
+        let typing = ctx.wants_keyboard_input();
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::H) || i.key_pressed(egui::Key::Backspace)) {
             self.go_up();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::Q)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -1515,6 +1518,73 @@ impl eframe::App for App {
 
         let mut side_clicked: Option<Vec<usize>> = None;
         let mut small_toggled: Option<Vec<usize>> = None;
+
+        // ---- vim keys for the sidebar: j/k move, gg/G first/last,
+        // Enter/l activate (h above already goes back). The cursor skips
+        // non-interactive note rows.
+        let mut key_scroll = false; // scroll the cursor row into view this frame
+        let modal_open = self.pending_trash.is_some() || self.pending_empty;
+        if !typing && !modal_open && !side_rows.is_empty() {
+            let interactive = |i: usize| !matches!(side_rows[i].kind, SideKind::Note);
+            let first = (0..side_rows.len()).find(|&i| interactive(i));
+            let last = (0..side_rows.len()).rev().find(|&i| interactive(i));
+            let step = |from: Option<usize>, down: bool| -> Option<usize> {
+                let Some(cur) = from else {
+                    return if down { first } else { last };
+                };
+                let it: Box<dyn Iterator<Item = usize>> = if down {
+                    Box::new(cur + 1..side_rows.len())
+                } else {
+                    Box::new((0..cur).rev())
+                };
+                it.filter(|&i| interactive(i)).next().or(from)
+            };
+            let (j, k, g, sg, act) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::J),
+                    i.key_pressed(egui::Key::K),
+                    i.key_pressed(egui::Key::G) && !i.modifiers.shift,
+                    i.key_pressed(egui::Key::G) && i.modifiers.shift,
+                    i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::L),
+                )
+            });
+            let before = self.side_sel;
+            if j {
+                self.side_sel = step(self.side_sel, true);
+            } else if k {
+                self.side_sel = step(self.side_sel, false);
+            } else if sg {
+                self.side_sel = last;
+            } else if g {
+                if self.pending_g {
+                    self.side_sel = first;
+                }
+                self.pending_g = !self.pending_g;
+            }
+            if j || k || sg {
+                self.pending_g = false;
+            }
+            key_scroll = self.side_sel != before && self.side_sel.is_some();
+            if act {
+                self.pending_g = false;
+                if let Some(s) = self.side_sel.filter(|&s| s < side_rows.len()) {
+                    match &side_rows[s].kind {
+                        SideKind::Item { path, is_dir } => {
+                            if *is_dir {
+                                side_clicked = Some(path.clone());
+                            }
+                        }
+                        SideKind::Toggle { key } => small_toggled = Some(key.clone()),
+                        SideKind::Note => {}
+                    }
+                }
+            }
+        }
+        // rows change with every scan/navigation; never point past the end
+        if self.side_sel.is_some_and(|s| s >= side_rows.len()) {
+            self.side_sel = if side_rows.is_empty() { None } else { Some(side_rows.len() - 1) };
+        }
+
         egui::SidePanel::left("list").resizable(false).exact_width(320.0).show(ctx, |ui| {
             // Everything in this panel must wrap, header included: a single
             // un-wrapped label that overflows the panel is unioned into the
@@ -1543,7 +1613,8 @@ impl eframe::App for App {
             ui.separator();
             let mut row_hover = None;
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for row in &side_rows {
+                for (ri, row) in side_rows.iter().enumerate() {
+                    let cursor = self.side_sel == Some(ri); // vim keyboard cursor
                     ui.horizontal(|ui| {
                         // wrap long names within the fixed panel width
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
@@ -1554,7 +1625,7 @@ impl eframe::App for App {
                                 let lit = hovered_path
                                     .as_ref()
                                     .is_some_and(|hp| hp.starts_with(path));
-                                let mut r = ui.selectable_label(lit, &row.label);
+                                let mut r = ui.selectable_label(lit || cursor, &row.label);
                                 if *is_dir {
                                     r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
                                 }
@@ -1564,18 +1635,24 @@ impl eframe::App for App {
                                 if r.clicked() && *is_dir {
                                     side_clicked = Some(path.clone());
                                 }
+                                if cursor && key_scroll {
+                                    r.scroll_to_me(None);
+                                }
                             }
                             SideKind::Toggle { key } => {
                                 let lit = hovered_lump && key.is_empty();
                                 // '›' — egui's bundled fonts lack U+25B8 '▸'
                                 let r = ui
-                                    .selectable_label(lit, format!("› {}", row.label))
+                                    .selectable_label(lit || cursor, format!("› {}", row.label))
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                                 if r.hovered() && key.is_empty() {
                                     row_hover = Some(Vec::new()); // = the lump wedge
                                 }
                                 if r.clicked() {
                                     small_toggled = Some(key.clone());
+                                }
+                                if cursor && key_scroll {
+                                    r.scroll_to_me(None);
                                 }
                             }
                             SideKind::Note => {
@@ -1593,6 +1670,7 @@ impl eframe::App for App {
                 self.nav.push(child);
             }
             self.small_focus = true;
+            self.side_sel = None;
         }
         if let Some(path) = side_clicked {
             // zoom via the matching wedge when it has one (children inside
@@ -1606,6 +1684,7 @@ impl eframe::App for App {
             } else {
                 self.nav.extend_from_slice(&path);
             }
+            self.side_sel = None;
         }
 
         // background trash-measure result (and possible empty outcome)

@@ -2,7 +2,7 @@
 
 disksun is an interactive disk-usage viewer for Linux. Each directory is drawn as a pie: every child is a wedge sized in proportion to its share of the parent, so a glance shows you where your space actually went. Written in Rust with [`eframe` / `egui`](https://github.com/emilk/egui), it runs on both Wayland and X11.
 
-Click a wedge to descend into it; `h`, `Backspace`, or the "Up" button to go back; `q` quits. Drag a wedge onto the trash can in the bottom-right to move that file or folder to the Trash — the trash can shows how much the Trash currently holds, and an Empty Trash button permanently deletes it all after a confirmation. The sidebar lists the largest children, and the top bar lets you rescan an arbitrary path, jump to any mounted partition, or scan the whole disk as admin (via sudo in a terminal).
+Click a wedge to descend into it; `h`, `Backspace`, or the "Up" button to go back; `q` quits. The sidebar drives vim-style: `j`/`k` move the cursor, `gg`/`G` jump to the first/last row, and `Enter` or `l` opens the selected item. Drag a wedge onto the trash can in the bottom-right to move that file or folder to the Trash — the trash can shows how much the Trash currently holds, and an Empty Trash button permanently deletes it all after a confirmation. The sidebar lists the largest children, and the top bar lets you rescan an arbitrary path, jump to any mounted partition, or scan the whole disk as admin (via sudo in a terminal).
 
 ![Screenshot](docs/screenshot.png)
 
