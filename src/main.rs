@@ -1392,6 +1392,12 @@ impl eframe::App for App {
         let mut side_clicked: Option<Vec<usize>> = None;
         let mut small_toggled: Option<Vec<usize>> = None;
         egui::SidePanel::left("list").resizable(false).exact_width(320.0).show(ctx, |ui| {
+            // Everything in this panel must wrap, header included: a single
+            // un-wrapped label that overflows the panel is unioned into the
+            // Ui's max_rect (egui Region::expand_to_include_rect), after
+            // which all rows below wrap at the inflated width and spill
+            // past the panel edge instead of wrapping at 320.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if (!self.nav.is_empty() || self.small_focus)
