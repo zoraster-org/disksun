@@ -619,6 +619,10 @@ enum State {
 struct App {
     scan_root: PathBuf,
     path_input: String,
+    scan_cross: bool,           // current scan crosses real-fs mounts (whole disk)
+    // directory-name chain to re-enter after a rescan (post-trash/cancel
+    // refreshes must not dump the user back at the scan root)
+    restore_nav: Option<Vec<String>>,
     state: State,
     prog: Arc<Progress>,
     nav: Vec<usize>,
@@ -650,6 +654,8 @@ impl App {
         let mut app = Self {
             path_input: path.to_string_lossy().into_owned(),
             scan_root: path,
+            scan_cross: cross_real,
+            restore_nav: None,
             state: State::Scanning { rx, admin: false },
             prog,
             nav: Vec::new(),
@@ -716,11 +722,28 @@ impl App {
         self.side_sel = None; // new view, new keyboard cursor
     }
 
+    /// Names of the directories along `nav` — indices shift when a
+    /// rescan resorts children, names survive.
+    fn nav_names(&self) -> Vec<String> {
+        let State::Ready(root) = &self.state else { return Vec::new() };
+        let mut n: &Node = root;
+        let mut out = Vec::new();
+        for &i in &self.nav {
+            if i < n.children.len() {
+                n = &n.children[i];
+                out.push(n.name.clone());
+            }
+        }
+        out
+    }
+
     fn begin_scan(&mut self, path: PathBuf, admin: bool, cross_real: bool) {
         self.mounts = read_mounts();
         self.prog = Arc::new(Progress::default());
         self.scan_root = path.clone();
         self.path_input = path.to_string_lossy().into_owned();
+        self.scan_cross = cross_real;
+        self.restore_nav = None; // only trash/cancel rescans re-enter the view
         self.nav.clear();
         self.wedges.clear();
         self.small_focus = false;
@@ -920,10 +943,14 @@ impl App {
             Err(e) => format!("Trash failed: {e}"),
         };
         self.toast = Some((msg, ctx.input(|i| i.time) + 5.0));
-        // rescan current volume to reflect the deletion
+        // rescan to reflect the deletion — same scope as before, and
+        // come back to the directory the user was looking at
+        let names = self.nav_names();
         let root = self.scan_root.clone();
         let admin = matches!(self.state, State::Scanning { admin: true, .. });
-        self.begin_scan(root, admin, false);
+        let cross = self.scan_cross;
+        self.begin_scan(root, admin, cross);
+        self.restore_nav = Some(names);
         self.refresh_trash(false); // the bin just gained content
     }
 
@@ -1065,11 +1092,16 @@ impl App {
                 self.hovered = wedge_at(mp);
             }
         }
-        // sidebar hover lights the matching slice exactly like chart hover
-        // (an empty path is the "(smaller items)" row -> the lump wedge)
-        if self.hovered.is_none() && !animating {
+        // sidebar hover / vim cursor light the matching slice like a hover
+        // would — but ONLY for lighting (an empty path is the "(smaller
+        // items)" row -> the lump wedge). This must never write into
+        // self.hovered: doing so made the empty chart background act as
+        // if the lit wedge were under the mouse — tooltip, click-to-zoom,
+        // even drag-to-trash of a wedge the user never touched.
+        let mut lit_wedge = self.hovered;
+        if lit_wedge.is_none() && !animating {
             if let Some(p) = &self.side_hover {
-                self.hovered = if p.is_empty() {
+                lit_wedge = if p.is_empty() {
                     self.wedges.iter().position(|w| w.lump && w.ring == 0)
                 } else {
                     self.wedges.iter().position(|w| w.ring + 1 == p.len() && w.path == *p)
@@ -1168,11 +1200,11 @@ impl App {
             };
             let (r0, mut r1) = band;
             let lit = !animating
-                && (self.hovered == Some(wi)
+                && (lit_wedge == Some(wi)
                     || self.dragging == Some(wi)
-                    || matches!(self.hovered, Some(h)
+                    || matches!(lit_wedge, Some(h)
                         if !w.path.is_empty() && self.wedges[h].path.starts_with(&w.path)));
-            if !animating && (self.hovered == Some(wi) || self.dragging == Some(wi)) {
+            if !animating && (lit_wedge == Some(wi) || self.dragging == Some(wi)) {
                 r1 += 3.0;
             }
             let (ci, co) = Self::wedge_fill(w, lit);
@@ -1265,9 +1297,12 @@ impl App {
                     format!("Restored {ok} item(s), {fail} failed")
                 };
                 self.toast = Some((msg, ui.ctx().input(|i| i.time) + 5.0));
+                let names = self.nav_names();
                 let root = self.scan_root.clone();
                 let admin = matches!(self.state, State::Scanning { admin: true, .. });
-                self.begin_scan(root, admin, false);
+                let cross = self.scan_cross;
+                self.begin_scan(root, admin, cross);
+                self.restore_nav = Some(names);
                 self.refresh_trash(false);
             }
         }
@@ -1409,6 +1444,18 @@ impl eframe::App for App {
                 Ok(n) => State::Ready(n),
                 Err(e) => State::Error(e),
             };
+            // post-trash/cancel rescan: re-enter the directory the user
+            // was in, by name (indices reshuffle when sizes resort)
+            if let (Some(names), State::Ready(root)) = (self.restore_nav.take(), &self.state) {
+                let mut n: &Node = root;
+                for name in &names {
+                    let Some(i) = n.children.iter().position(|c| &c.name == name) else {
+                        break; // dir gone (it was the thing trashed) — stop here
+                    };
+                    self.nav.push(i);
+                    n = &n.children[i];
+                }
+            }
         }
 
         // ---- top bar ----
@@ -1433,9 +1480,14 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label("Path:");
                 let edit = ui.text_edit_singleline(&mut self.path_input);
-                let go = ui.button("Rescan").clicked()
-                    || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                if go {
+                if ui
+                    .button("Rescan")
+                    .on_hover_text("Fresh scan of the whole disk")
+                    .clicked()
+                {
+                    self.begin_scan(PathBuf::from("/"), false, true);
+                }
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let p = PathBuf::from(self.path_input.trim());
                     if p.is_dir() {
                         self.begin_scan(p, false, false);
@@ -1733,13 +1785,14 @@ impl eframe::App for App {
                 };
                 it.filter(|&i| interactive(i)).next().or(from)
             };
-            let (j, k, g, sg, act) = ctx.input(|i| {
+            let (j, k, g, sg, act, del) = ctx.input(|i| {
                 (
                     i.key_pressed(egui::Key::J),
                     i.key_pressed(egui::Key::K),
                     i.key_pressed(egui::Key::G) && !i.modifiers.shift,
                     i.key_pressed(egui::Key::G) && i.modifiers.shift,
                     i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::L),
+                    i.key_pressed(egui::Key::D),
                 )
             });
             let before = self.side_sel;
@@ -1770,6 +1823,23 @@ impl eframe::App for App {
                         }
                         SideKind::Toggle { key } => small_toggled = Some(key.clone()),
                         SideKind::Note => {}
+                    }
+                }
+            } else if del {
+                // d: move the selected item to the Trash (same confirm
+                // modal as a drag onto the bin)
+                self.pending_g = false;
+                if let Some(s) = self.side_sel.filter(|&s| s < side_rows.len()) {
+                    if let SideKind::Item { path, .. } = &side_rows[s].kind {
+                        if let Some(w) = self
+                            .wedges
+                            .iter()
+                            .find(|w| w.ring + 1 == path.len() && w.path == *path)
+                        {
+                            if let Some(abs) = w.abs.clone() {
+                                self.pending_trash = Some((abs, w.name.clone()));
+                            }
+                        }
                     }
                 }
             }
