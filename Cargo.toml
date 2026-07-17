@@ -1,0 +1,19 @@
+[package]
+name = "disksun"
+version = "0.1.0"
+edition = "2021"
+description = "interactive sunburst disk-usage viewer"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = [
+    "glow",
+    "wayland",
+    "x11",
+    "default_fonts",
+] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
