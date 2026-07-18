@@ -2155,6 +2155,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("disksun")
             .with_inner_size([1150.0, 760.0])
+            .with_min_inner_size([700.0, 480.0])
             .with_title("disksun"),
         ..Default::default()
     };
