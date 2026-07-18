@@ -26,10 +26,11 @@ fi
 have_lib() {
   { ldconfig -p 2>/dev/null || /sbin/ldconfig -p 2>/dev/null; } | grep -q "$1"
 }
+# winit picks Wayland or X11 at runtime and falls back to X11 whenever
+# WAYLAND_DISPLAY is absent, and bare `startx` setups leave
+# XDG_SESSION_TYPE unset — so check both stacks unconditionally.
 libs="libwayland-client.so.0 libxkbcommon.so.0 libEGL.so.1 libGL.so.1"
-if [ "${XDG_SESSION_TYPE:-}" = "x11" ]; then
-  libs="$libs libX11.so.6 libXcursor.so.1"
-fi
+libs="$libs libX11.so.6 libXcursor.so.1 libXrandr.so.2 libXi.so.6 libxkbcommon-x11.so.0"
 missing=""
 for lib in $libs; do
   have_lib "$lib" || missing="$missing $lib"
@@ -37,13 +38,13 @@ done
 if [ -n "$missing" ]; then
   printf '\nMissing runtime libraries:%s\n' "$missing"
   if command -v dnf >/dev/null 2>&1; then
-    dep_cmd="sudo dnf install -y libwayland-client libxkbcommon libglvnd-egl libglvnd-glx libX11 libXcursor"
+    dep_cmd="sudo dnf install -y libwayland-client libxkbcommon libxkbcommon-x11 libglvnd-egl libglvnd-glx libX11 libXcursor libXrandr libXi"
   elif command -v apt-get >/dev/null 2>&1; then
-    dep_cmd="sudo apt-get install -y libwayland-client0 libxkbcommon0 libegl1 libgl1 libx11-6 libxcursor1"
+    dep_cmd="sudo apt-get install -y libwayland-client0 libxkbcommon0 libxkbcommon-x11-0 libegl1 libgl1 libx11-6 libxcursor1 libxrandr2 libxi6"
   elif command -v pacman >/dev/null 2>&1; then
-    dep_cmd="sudo pacman -S --needed wayland libxkbcommon libglvnd libx11 libxcursor"
+    dep_cmd="sudo pacman -S --needed wayland libxkbcommon libxkbcommon-x11 libglvnd libx11 libxcursor libxrandr libxi"
   elif command -v zypper >/dev/null 2>&1; then
-    dep_cmd="sudo zypper install libwayland-client0 libxkbcommon0 Mesa-libEGL1 Mesa-libGL1 libX11-6 libXcursor1"
+    dep_cmd="sudo zypper install libwayland-client0 libxkbcommon0 libxkbcommon-x11-0 Mesa-libEGL1 Mesa-libGL1 libX11-6 libXcursor1 libXrandr2 libXi6"
   else
     dep_cmd=""
   fi

@@ -24,7 +24,10 @@ interactive pie / sunburst disk-usage viewer for Linux.
 Drag a wedge to trash, click to descend, scan whole disk as admin."""
 section = "utility"
 priority = "optional"
-depends = "$auto"
+# $auto only sees ELF NEEDED entries; winit/glow dlopen the X11/Wayland/GL
+# stack at runtime, so those must be declared by hand (verified by startup
+# crashes on minimal X11 installs: libxkbcommon-x11, libXi).
+depends = "$auto, libx11-6, libxcursor1, libxrandr2, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libegl1, libgl1"
 assets = [
     ["target/release/disksun",           "usr/bin/",                                  "755"],
     ["contrib/disksun.desktop",          "usr/share/applications/",                   "644"],
@@ -49,6 +52,21 @@ assets = [
     { source = "LICENSE",                   dest = "/usr/share/doc/disksun/LICENSE",                       mode = "644", doc = true },
 ]
 auto-req = "builtin"
+
+# builtin auto-req only sees ELF NEEDED entries; the dlopen'd GUI stack
+# must be declared by hand (same reason as the deb depends above).
+[package.metadata.generate-rpm.requires]
+libX11 = "*"
+libXcursor = "*"
+libXrandr = "*"
+libXi = "*"
+libxkbcommon = "*"
+"libxkbcommon-x11" = "*"
+"libwayland-client" = "*"
+"libwayland-cursor" = "*"
+"libwayland-egl" = "*"
+"libglvnd-egl" = "*"
+"libglvnd-glx" = "*"
 
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = [

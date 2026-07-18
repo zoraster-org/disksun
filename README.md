@@ -56,6 +56,7 @@ disksun = pkgs.rustPlatform.buildRustPackage {
   postFixup = ''
     wrapProgram $out/bin/disksun --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
       pkgs.wayland pkgs.libxkbcommon pkgs.libglvnd
+      pkgs.xorg.libX11 pkgs.xorg.libXcursor pkgs.xorg.libXrandr pkgs.xorg.libXi
     ]}
   '';
 };
