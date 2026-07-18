@@ -635,6 +635,7 @@ struct App {
     session_trash: Vec<TrashedItem>,  // trashed this session; Cancel/quit restores
     side_sel: Option<usize>,          // keyboard cursor: index into the sidebar rows
     pending_g: bool,                  // first g of a gg chord was pressed
+    show_help: bool,                  // "?" keys & help window is open
     trash_size: Option<u64>,          // None until the first background measure lands
     // (new size, Some(ok) if this refresh also emptied the trash)
     trash_rx: Option<mpsc::Receiver<(u64, Option<bool>)>>,
@@ -668,6 +669,7 @@ impl App {
             session_trash: Vec::new(),
             side_sel: None,
             pending_g: false,
+            show_help: false,
             trash_size: None,
             trash_rx: None,
             toast: None,
@@ -1273,6 +1275,25 @@ impl App {
 
         Self::draw_trash_can(&painter, trash, over_trash && self.dragging.is_some());
 
+        // subtle round "?" in the top-right: keys & help
+        let help_rect = Rect::from_center_size(
+            egui::pos2(rect.right() - 20.0, rect.top() + 20.0),
+            vec2(22.0, 22.0),
+        );
+        let hb = ui
+            .put(
+                help_rect,
+                egui::Button::new(
+                    egui::RichText::new("?").size(12.0).color(Color32::from_gray(170)),
+                )
+                .corner_radius(egui::CornerRadius::same(11)),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Keys & help (?)");
+        if hb.clicked() {
+            self.show_help = !self.show_help;
+        }
+
         // Cancel: un-trash everything this session moved to the bin
         if !self.session_trash.is_empty() {
             let cancel_rect = Rect::from_min_max(
@@ -1424,6 +1445,9 @@ impl eframe::App for App {
         }
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::Q)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::Questionmark)) {
+            self.show_help = !self.show_help;
         }
 
         // collect a finished scan
@@ -1785,7 +1809,7 @@ impl eframe::App for App {
                 };
                 it.filter(|&i| interactive(i)).next().or(from)
             };
-            let (j, k, g, sg, act, del) = ctx.input(|i| {
+            let (j, k, g, sg, act, del, cp) = ctx.input(|i| {
                 (
                     i.key_pressed(egui::Key::J),
                     i.key_pressed(egui::Key::K),
@@ -1793,6 +1817,7 @@ impl eframe::App for App {
                     i.key_pressed(egui::Key::G) && i.modifiers.shift,
                     i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::L),
                     i.key_pressed(egui::Key::D),
+                    i.key_pressed(egui::Key::C),
                 )
             });
             let before = self.side_sel;
@@ -1825,9 +1850,9 @@ impl eframe::App for App {
                         SideKind::Note => {}
                     }
                 }
-            } else if del {
+            } else if del || cp {
                 // d: move the selected item to the Trash (same confirm
-                // modal as a drag onto the bin)
+                // modal as a drag onto the bin); c: copy its path
                 self.pending_g = false;
                 if let Some(s) = self.side_sel.filter(|&s| s < side_rows.len()) {
                     if let SideKind::Item { path, .. } = &side_rows[s].kind {
@@ -1837,7 +1862,15 @@ impl eframe::App for App {
                             .find(|w| w.ring + 1 == path.len() && w.path == *path)
                         {
                             if let Some(abs) = w.abs.clone() {
-                                self.pending_trash = Some((abs, w.name.clone()));
+                                if del {
+                                    self.pending_trash = Some((abs, w.name.clone()));
+                                } else {
+                                    ctx.copy_text(abs.to_string_lossy().into_owned());
+                                    self.toast = Some((
+                                        format!("Copied: {}", abs.display()),
+                                        ctx.input(|i| i.time) + 3.0,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -2015,6 +2048,53 @@ impl eframe::App for App {
             if close {
                 self.pending_trash = None;
             }
+        }
+
+        // ---- keys & help window ----
+        if self.show_help {
+            let mut open = true;
+            egui::Window::new("Keys & help")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::RIGHT_TOP, [-12.0, 46.0])
+                .show(ctx, |ui| {
+                    let row = |ui: &mut egui::Ui, key: &str, what: &str| {
+                        ui.label(egui::RichText::new(key).monospace().strong());
+                        ui.label(what);
+                        ui.end_row();
+                    };
+                    ui.label(egui::RichText::new("Chart").strong());
+                    egui::Grid::new("help-chart").num_columns(2).show(ui, |ui| {
+                        row(ui, "click wedge", "open that directory");
+                        row(ui, "click hub · h · Backspace", "go up one level");
+                        row(ui, "drag wedge to bin", "move to Trash (staged)");
+                        row(ui, "q", "quit");
+                    });
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Sidebar (vim)").strong());
+                    egui::Grid::new("help-vim").num_columns(2).show(ui, |ui| {
+                        row(ui, "j / k", "move the cursor");
+                        row(ui, "gg / G", "first / last row");
+                        row(ui, "Enter / l", "open the selected item");
+                        row(ui, "d", "move it to the Trash");
+                        row(ui, "c", "copy its path");
+                    });
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Trash").strong());
+                    egui::Grid::new("help-trash").num_columns(2).show(ui, |ui| {
+                        row(ui, "Cancel", "restore this session's trashed items");
+                        row(ui, "Empty Trash", "delete them forever (asks first)");
+                        row(ui, "quit", "also restores anything un-emptied");
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("? toggles this window")
+                            .weak()
+                            .small(),
+                    );
+                });
+            self.show_help = open;
         }
 
         // ---- empty-trash confirm modal ----
