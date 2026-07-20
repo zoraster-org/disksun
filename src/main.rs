@@ -1660,7 +1660,6 @@ impl eframe::App for App {
             // clickable "(N smaller items)" pseudo-folder (top level and
             // sub-layer alike) that navigates into a view of just them
             const MAX_TOP: usize = 30;
-            const MAX_SUB: usize = 10;
             const MAX_FOCUS_ROWS: usize = 400;
             let mut wedge_col: std::collections::HashMap<&[usize], Color32> =
                 std::collections::HashMap::new();
@@ -1703,34 +1702,14 @@ impl eframe::App for App {
                     }
                     break;
                 }
+                // direct children only — a child's own contents show up
+                // after descending into it, not as indented sub-rows
                 side.push(SideRow {
                     label: row_label(c, total),
                     color: wedge_col.get(&[i][..]).copied().unwrap_or(grey),
                     indent: 0,
                     kind: SideKind::Item { path: vec![i], is_dir: c.is_dir },
                 });
-                for (j, gc) in c.children.iter().enumerate() {
-                    let g_small = (gc.size as f64) < c.size.max(1) as f64 * SMALL_FRAC;
-                    if g_small || gc.size == 0 || j >= MAX_SUB {
-                        let rest = &c.children[j..];
-                        let rest_size: u64 = rest.iter().map(|n| n.size).sum();
-                        if rest_size > 0 {
-                            side.push(SideRow {
-                                label: toggle_label(rest.len(), rest_size),
-                                color: grey,
-                                indent: 1,
-                                kind: SideKind::Toggle { key: vec![i] },
-                            });
-                        }
-                        break;
-                    }
-                    side.push(SideRow {
-                        label: row_label(gc, total),
-                        color: wedge_col.get(&[i, j][..]).copied().unwrap_or(grey),
-                        indent: 1,
-                        kind: SideKind::Item { path: vec![i, j], is_dir: gc.is_dir },
-                    });
-                }
             }
             (total, name, wedges, side)
         };
